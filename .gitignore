@@ -2,7 +2,7 @@
 /docs
 backend/__pycache__/
 backend/*.pyc
-backend/model.pkl
+backend/*.pkl
 backend/.venv/
 backend/venv/
 frontend/node_modules/

@@ -26,6 +26,12 @@ predictor = WorldCupPredictor()
 model_path = os.path.join(os.path.dirname(__file__), 'model.pkl')
 try:
     predictor.model = joblib.load(model_path)
+    # Try to load score models if they exist
+    try:
+        predictor.home_goals_model = joblib.load(os.path.join(os.path.dirname(__file__), 'home_goals_model.pkl'))
+        predictor.away_goals_model = joblib.load(os.path.join(os.path.dirname(__file__), 'away_goals_model.pkl'))
+    except:
+        pass
 except:
     predictor.train()
 
@@ -36,7 +42,7 @@ class MatchPredictionRequest(BaseModel):
     neutral: bool = True
 
 class TournamentSimulationRequest(BaseModel):
-    iterations: int = 10000
+    iterations: int = 1000
 
 @app.get("/health")
 async def health():
@@ -96,29 +102,46 @@ async def batch_predict(matches: list):
         return {"error": str(e)}
 
 @app.get("/schedule")
-async def get_tournament_schedule():
-    """Get 2026 World Cup schedule"""
+async def get_tournament_schedule(tournament: str = None):
+    """Get tournament schedule, optionally filtered by tournament name"""
     try:
-        wc_2026 = predictor.results_df[
-            (predictor.results_df['date'] >= '2026-06-01')
-        ].copy()
+        df = predictor.results_df.copy()
+
+        # Filter by upcoming matches (no score yet)
+        df = df[df['home_score'].isna()]
+
+        # Filter by tournament if provided
+        if tournament:
+            df = df[df['tournament'] == tournament]
 
         # Group by date
         schedule = []
-        for date in sorted(wc_2026['date'].unique()):
-            matches = wc_2026[wc_2026['date'] == date]
+        for date in sorted(df['date'].unique()):
+            matches = df[df['date'] == date]
             day_matches = []
             for _, match in matches.iterrows():
                 day_matches.append({
                     'home_team': match['home_team'],
                     'away_team': match['away_team'],
+                    'tournament': match['tournament'],
                     'city': match['city'],
                     'country': match['country'],
                     'date': str(match['date'])
                 })
-            schedule.append({"date": date, "matches": day_matches})
+            schedule.append({"date": str(date), "matches": day_matches})
 
         return {"schedule": schedule}
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/tournaments")
+async def get_available_tournaments():
+    """Get list of available tournaments"""
+    try:
+        # Only show tournaments with upcoming matches
+        upcoming = predictor.results_df[predictor.results_df['home_score'].isna()]
+        tournaments = sorted(upcoming['tournament'].unique().tolist())
+        return {"tournaments": tournaments}
     except Exception as e:
         return {"error": str(e)}
 

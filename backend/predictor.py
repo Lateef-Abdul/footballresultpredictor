@@ -2,9 +2,11 @@ import pandas as pd
 import numpy as np
 from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.preprocessing import LabelEncoder
+from sklearn.linear_model import PoissonRegressor
 import joblib
 from datetime import datetime
 import os
+import math
 
 # Get the project root directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -21,6 +23,8 @@ class WorldCupPredictor:
         self.home_encoder = LabelEncoder()
         self.away_encoder = LabelEncoder()
         self.model = None
+        self.home_goals_model = None
+        self.away_goals_model = None
         self.feature_scaler = None
 
     def create_features(self, home_team, away_team, tournament, neutral=False):
@@ -85,6 +89,43 @@ class WorldCupPredictor:
 
         return features
 
+    def train_score_models(self):
+        """Train Poisson regression models for predicting goals"""
+        print("Training score prediction models...")
+
+        train_df = self.results_df[
+            (self.results_df['home_score'].notna()) &
+            (self.results_df['date'] >= '2015-01-01')
+        ].copy()
+
+        X = []
+        home_goals = []
+        away_goals = []
+
+        for _, row in train_df.iterrows():
+            try:
+                features = self.create_features(
+                    row['home_team'],
+                    row['away_team'],
+                    row['tournament'],
+                    row['neutral']
+                )
+                X.append(list(features.values()))
+                home_goals.append(int(row['home_score']))
+                away_goals.append(int(row['away_score']))
+            except:
+                continue
+
+        X = np.array(X)
+
+        self.home_goals_model = PoissonRegressor(alpha=0.1)
+        self.away_goals_model = PoissonRegressor(alpha=0.1)
+
+        self.home_goals_model.fit(X, home_goals)
+        self.away_goals_model.fit(X, away_goals)
+
+        print(f"✓ Score models trained on {len(X)} matches")
+
     def train(self):
         """Train the model"""
         print("Training prediction model...")
@@ -130,13 +171,18 @@ class WorldCupPredictor:
         )
         self.model.fit(X, y)
 
+        # Train score models
+        self.train_score_models()
+
         # Save model
         model_path = os.path.join(SCRIPT_DIR, 'model.pkl')
         joblib.dump(self.model, model_path)
+        joblib.dump(self.home_goals_model, os.path.join(SCRIPT_DIR, 'home_goals_model.pkl'))
+        joblib.dump(self.away_goals_model, os.path.join(SCRIPT_DIR, 'away_goals_model.pkl'))
         print(f"✓ Model trained on {len(X)} matches")
 
     def predict_match(self, home_team, away_team, tournament='Friendly', neutral=False):
-        """Predict match outcome"""
+        """Predict match outcome and probable score"""
         if self.model is None:
             self.train()
 
@@ -145,75 +191,99 @@ class WorldCupPredictor:
 
         proba = self.model.predict_proba(X)[0]
 
+        # Predict scores using Poisson regression
+        home_goals_raw = float(self.home_goals_model.predict(X)[0])
+        away_goals_raw = float(self.away_goals_model.predict(X)[0])
+
+        # Use ELO difference to adjust predictions (stronger team should score more)
+        elo_diff = features['elo_diff']
+        elo_factor = 1.0 + (elo_diff / 400.0) * 0.3  # Modest ELO adjustment
+
+        home_goals_pred = max(0.3, home_goals_raw * elo_factor)
+        away_goals_pred = max(0.3, away_goals_raw * (1.0 / elo_factor))
+
+        # Clamp to reasonable values
+        home_goals_pred = min(4.0, home_goals_pred)
+        away_goals_pred = min(4.0, away_goals_pred)
+
+        # Generate probable scorelines based on Poisson distribution
+        probable_scores = []
+        for h in range(0, 6):
+            for a in range(0, 6):
+                try:
+                    home_prob = (np.exp(-home_goals_pred) * (home_goals_pred ** h)) / math.factorial(h)
+                    away_prob = (np.exp(-away_goals_pred) * (away_goals_pred ** a)) / math.factorial(a)
+                    score_prob = home_prob * away_prob
+                    if score_prob > 0.005:
+                        probable_scores.append({
+                            'score': f"{h}-{a}",
+                            'probability': float(score_prob)
+                        })
+                except:
+                    continue
+
+        probable_scores.sort(key=lambda x: x['probability'], reverse=True)
+
         return {
             'home_team': home_team,
             'away_team': away_team,
             'away_win': float(proba[0]),
             'draw': float(proba[1]),
-            'home_win': float(proba[2])
+            'home_win': float(proba[2]),
+            'predicted_home_goals': round(home_goals_pred, 2),
+            'predicted_away_goals': round(away_goals_pred, 2),
+            'probable_scores': probable_scores[:5]
         }
 
-    def simulate_tournament(self, n_iterations=10000):
-        """Monte Carlo tournament simulation"""
-        # Load 2026 tournament matches
-        wc_2026 = self.results_df[
-            (self.results_df['date'] >= '2026-06-01') &
-            (self.results_df['home_score'].isna())
+    def simulate_tournament(self, n_iterations=1000):
+        """Monte Carlo tournament simulation (optimized)"""
+        # Load upcoming tournament matches (not yet played)
+        wc_matches = self.results_df[
+            self.results_df['home_score'].isna()
         ].copy()
 
-        print(f"Simulating {len(wc_2026)} tournament matches {n_iterations} times...")
+        if len(wc_matches) == 0:
+            return [("No upcoming matches", 0.0)]
 
-        # Group matches into stages
-        group_stage = wc_2026[wc_2026['date'] < '2026-07-01']
-        knockout_stage = wc_2026[wc_2026['date'] >= '2026-07-01']
+        print(f"Simulating {len(wc_matches)} tournament matches {n_iterations} times...")
+
+        # Pre-compute predictions for all matches
+        match_predictions = {}
+        for _, match in wc_matches.iterrows():
+            key = (match['home_team'], match['away_team'])
+            if key not in match_predictions:
+                pred = self.predict_match(
+                    match['home_team'],
+                    match['away_team'],
+                    match['tournament'],
+                    match['neutral']
+                )
+                match_predictions[key] = pred
 
         champions = {}
 
         for iteration in range(n_iterations):
-            # Simulate group stage
-            group_results = {}
-            for _, match in group_stage.iterrows():
-                pred = self.predict_match(
-                    match['home_team'],
-                    match['away_team'],
-                    'FIFA World Cup',
-                    match['neutral']
-                )
-                r = np.random.random()
-                if r < pred['away_win']:
-                    group_results[f"{match['away_team']}_{iteration}"] = 1
-                elif r < pred['away_win'] + pred['draw']:
-                    group_results[f"{match['away_team']}_{iteration}"] = 0.5
-                    group_results[f"{match['home_team']}_{iteration}"] = 0.5
-                else:
-                    group_results[f"{match['home_team']}_{iteration}"] = 1
+            for _, match in wc_matches.iterrows():
+                key = (match['home_team'], match['away_team'])
+                pred = match_predictions[key]
 
-            # Simulate knockout stage (simplified)
-            for _, match in knockout_stage.iterrows():
-                pred = self.predict_match(
-                    match['home_team'],
-                    match['away_team'],
-                    'FIFA World Cup',
-                    match['neutral']
-                )
                 r = np.random.random()
                 if r < pred['away_win']:
                     winner = match['away_team']
                 elif r < pred['away_win'] + pred['draw']:
-                    # 50-50 for penalties
                     winner = match['away_team'] if np.random.random() > 0.5 else match['home_team']
                 else:
                     winner = match['home_team']
 
-                # Track final winner (simplified - last match)
                 champions[winner] = champions.get(winner, 0) + 1
 
-            if (iteration + 1) % 1000 == 0:
+            if (iteration + 1) % 100 == 0 and n_iterations > 500:
                 print(f"  Completed {iteration + 1}/{n_iterations} simulations")
 
-        # Calculate champion probabilities
+        # Normalize probabilities to 100%
+        total = sum(champions.values())
         results = {
-            team: (count / n_iterations) * 100
+            team: (count / total) * 100
             for team, count in champions.items()
         }
 
